@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils import sample_inverse_gamma
+from utils import sample_inverse_gamma, retrieve_all_elements_from_dataloader
 
 
 class SgldBayesianRegression:
@@ -49,11 +49,86 @@ class SgldBayesianRegression:
         self.burn_in_epochs = burn_in_epochs
         self.batch_size = batch_size
         self.model = model
-        self.TOTAL_SAMPLE_SIZE = None
-        self.samples = {'params': [], 'sigma_squared': [], 'sigma_theta_squared': [], 'sigma_lambda_squared': [], 'nu': [], 'beta': [], 'mse': []}
+        self.TOTAL_TRAIN_SAMPLE_SIZE = None
+        self.samples = {'params': [], 'sigma_squared': [], 'sigma_theta_squared': [], 'sigma_lambda_squared': [],
+                        'nu': [], 'beta': [], 'train_mse': [], 'train_r2': [], 'eval_mse': [], 'eval_r2': []}
+
+    def train_and_eval(self, train_loader, eval_loader):
+        all_X_train, all_y_train = retrieve_all_elements_from_dataloader(train_loader, self.device)
+        self.TOTAL_TRAIN_SAMPLE_SIZE = len(train_loader.dataset)
+        print(self.TOTAL_TRAIN_SAMPLE_SIZE)
+        with torch.no_grad():
+            residual_squared_sum = self._calculate_and_set_residual_squared_sum(all_X_train, all_y_train)
+            sigma_squared = self._sample_sigma_squared(all_y_train.shape[0], residual_squared_sum)
+            sigma_theta_squared = self._sample_sigma_theta_squared()
+
+        start_time = time.time()
+        for epoch in range(self.num_epochs):
+            if epoch % 100 == 0:
+                print(f"Epoch {epoch + 1}/{self.num_epochs}")
+                print(f"time elapsed {time.time() - start_time} seconds")
+            for X_batch, y_batch in train_loader:
+                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                sigma_squared, sigma_theta_squared = self.train_one_batch(X_batch, y_batch, sigma_squared, sigma_theta_squared)
+            for X_batch, y_batch in eval_loader:
+                X_batch, y_batch = X_batch.to(self.device), y_batch.to(self.device)
+                self.evaluate_one_batch(X_batch, y_batch)
+
+    def evaluate_one_batch(self, X_batch, y_batch):
+        with torch.no_grad():
+            residual_squared_sum = self._calculate_and_set_residual_squared_sum(X_batch, y_batch)
+        mse = residual_squared_sum / y_batch.shape[0]
+        r2 = 1 - mse / torch.var(y_batch).item()
+        self.samples['eval_mse'].append(mse)
+        self.samples['eval_r2'].append(r2)
+
+    def train_one_batch(self, X_batch, y_batch, sigma_squared, sigma_theta_squared):
+        self.model.zero_grad()
+        # print(f'train:: X_batch.shape={X_batch.shape}, y_batch.shape={y_batch.shape}')
+        # total_grad is 1D vector, concatenated by all parameters in the model, which is a_for_eigen common practice
+        residual_squared_sum = self._calculate_and_set_residual_squared_sum(X_batch, y_batch)
+        total_grad = self._calculate_total_grad_and_distribute_gradient_to_each_param(y_batch, sigma_squared, sigma_theta_squared, residual_squared_sum)
+        with torch.no_grad():
+            # for name, param in self.model.named_parameters():
+            #     print(f"Layer: {name}")
+            #     print(f"Shape: {param.shape}")
+            #     print(f"Values:\n{param.data}")
+            #     print("-" * 30)
+            param_list = [p for p in self.model.parameters()]
+            for i, param in enumerate(param_list):
+                # print(f'train:: i={i} param={param}')
+                start_idx = sum(p.numel() for p in param_list[:i])
+                end_idx = start_idx + param.numel()
+                # Extract the corresponding gradient slice and reshape it to match param's shape
+                grad_slice = total_grad[start_idx:end_idx].reshape(param.shape)
+
+                # Generate noise with the same shape as param
+                param_noise = torch.randn_like(param) * torch.sqrt(
+                    torch.tensor(2.0 * self.step_size, device=self.device))
+
+                # Update param in-place
+                param.add_(self.step_size * grad_slice + param_noise)
+
+            sigma_squared = self._sample_sigma_squared(y_batch.shape[0], residual_squared_sum)
+            sigma_theta_squared = self._sample_sigma_theta_squared()
+            sigma_lambda_squared = self.model.sample_sigma_lambda_squared()
+            beta = self.model.get_beta().cpu().numpy()
+            nu = self.model.calculate_and_set_nu()
+            params_flat = torch.cat([p.detach().flatten() for p in self.model.parameters()]).cpu().numpy()
+
+            mse = residual_squared_sum / y_batch.shape[0]
+            self.samples['train_mse'].append(mse)
+            self.samples['train_r2'].append(1 - mse / torch.var(y_batch).item())
+            self.samples['params'].append(params_flat)
+            self.samples['sigma_squared'].append(sigma_squared)
+            self.samples['sigma_theta_squared'].append(sigma_theta_squared)
+            self.samples['sigma_lambda_squared'].append(sigma_lambda_squared)
+            self.samples['nu'].append(nu)
+            self.samples['beta'].append(beta)
+        return sigma_squared, sigma_theta_squared
 
     def train(self, X_train, y_train):
-        self.TOTAL_SAMPLE_SIZE = len(X_train)
+        self.TOTAL_TRAIN_SAMPLE_SIZE = len(X_train)
         X = X_train.to(self.device)
         y = y_train.to(self.device)
         with torch.no_grad():
@@ -64,12 +139,12 @@ class SgldBayesianRegression:
         dataset = TensorDataset(X, y)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         start_time = time.time()
-        #print(self.model.input_layer.beta)
+        # print(self.model.input_layer.beta)
         for epoch in range(self.num_epochs):
             # print(f'epoch={epoch}')
             if epoch % 100 == 0:
                 print(f"Epoch {epoch + 1}/{self.num_epochs}")
-                print(f"time elapsed {time.time()-start_time} seconds")
+                print(f"time elapsed {time.time() - start_time} seconds")
             for batch_idx, (X_batch, y_batch) in enumerate(dataloader):
                 self.model.zero_grad()
                 # print(f'train:: batch_idx={batch_idx} X_batch.shape={X_batch.shape}, y_batch.shape={y_batch.shape}')
@@ -106,7 +181,8 @@ class SgldBayesianRegression:
                     params_flat = torch.cat([p.detach().flatten() for p in self.model.parameters()]).cpu().numpy()
 
                     mse = residual_squared_sum / y_batch.shape[0]
-                    self.samples['mse'].append(mse)
+                    self.samples['train_mse'].append(mse)
+                    self.samples['train_r2'].append(1 - mse / torch.var(y_train).item())
                     self.samples['params'].append(params_flat)
                     self.samples['sigma_squared'].append(sigma_squared)
                     self.samples['sigma_theta_squared'].append(sigma_theta_squared)
@@ -139,12 +215,12 @@ class SgldBayesianRegression:
     def _calculate_and_set_residual_squared_sum(self, X, y):
         y_pred = self.model(X)
         residuals = y - y_pred.squeeze()
-        return torch.sum(residuals**2)
+        return torch.sum(residuals ** 2)
 
     def _calculate_total_grad_and_distribute_gradient_to_each_param(self, y_batch, sigma_squared, sigma_theta_squared, residual_squared_sum):
         # calculate the total_grad and update parameters
         likelihood_grad = self._get_gradient_of_log_prob_likelihood(y_batch, sigma_squared, residual_squared_sum)
-        likelihood_grad_scaled = (self.TOTAL_SAMPLE_SIZE / self.batch_size) * likelihood_grad
+        likelihood_grad_scaled = (self.TOTAL_TRAIN_SAMPLE_SIZE / self.batch_size) * likelihood_grad
         prior_grad = self._get_gradient_of_log_prob_prior(sigma_theta_squared)
         total_grad = likelihood_grad_scaled + prior_grad
         return total_grad
@@ -184,7 +260,7 @@ class SgldBayesianRegression:
 
             # Compute β^T β / 2 from current model parameters
             theta = torch.cat([p.flatten() for p in self.model.parameters()]).to(self.device)  # Flatten all parameters into a_for_eigen vector
-            theta_squared_sum = torch.sum(theta**2)  # β^T β
+            theta_squared_sum = torch.sum(theta ** 2)  # β^T β
             # New shape and scale parameters for σβ^2 (equation 21)
             new_a_theta = self.a_theta + p / 2.0
             new_b_theta = self.b_theta + theta_squared_sum / 2.0

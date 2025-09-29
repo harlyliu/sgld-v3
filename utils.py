@@ -6,19 +6,31 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def plot_mse(trainer, start=0, end=-1):
-    _plot_values(trainer.samples['mse'][start:end], 'Mean Squared Error', 'Mean Squared Error over Samples/Iterations',
-                'Sample/Iteration Number', 'Mean Squared Error (MSE)')
+def retrieve_all_elements_from_dataloader(loader, device='cpu'):
+    X_list, y_list = [], []
+    for X_batch, y_batch in loader:
+        X_list.append(X_batch)
+        y_list.append(y_batch)
+    X_train = torch.cat(X_list).to(device)
+    y_train = torch.cat(y_list).to(device)
+    return X_train, y_train
+
+
+def plot_r2(r2, start=0, end=-1):
+    _plot_values(r2[start:end], 'r2 Error', 'r2 over Samples/Iterations',
+                 'Sample/Iteration Number', 'r2')
+
+
+def plot_mse(mse, start=0, end=-1):
+    _plot_values(mse[start:end], 'Mean Squared Error', 'Mean Squared Error over Samples/Iterations', 'Sample/Iteration Number', 'Mean Squared Error (MSE)')
 
 
 def plot_sigma_squared(trainer, start=0, end=-1):
-    _plot_values(trainer.samples['sigma_squared'][start:end], 'sigma squared', 'Sigma squared over Samples/Iterations',
-                'Sample/Iteration Number', 'Sigma squared')
+    _plot_values(trainer.samples['sigma_squared'][start:end], 'sigma squared', 'Sigma squared over Samples/Iterations',  'Sample/Iteration Number', 'Sigma squared')
 
 
 def plot_sigma_theta_squared(trainer, start=0, end=-1):
-    _plot_values(trainer.samples['sigma_theta_squared'][start:end], 'sigma theta squared',
-                'Sigma theta squared over Samples/Iterations', 'Sample/Iteration Number', 'Sigma theta squared')
+    _plot_values(trainer.samples['sigma_theta_squared'][start:end], 'sigma theta squared', 'Sigma theta squared over Samples/Iterations', 'Sample/Iteration Number', 'Sigma theta squared')
 
 
 def _plot_values(vals, label, title, xlabel, ylabel):
